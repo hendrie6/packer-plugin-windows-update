@@ -1,21 +1,21 @@
 # see Using the Windows Update Agent API | Searching, Downloading, and Installing Updates
-#     at https://msdn.microsoft.com/en-us/library/windows/desktop/aa387102(v=vs.85).aspx
+#     at https://learn.microsoft.com/en-us/windows/win32/wua_sdk/searching--downloading--and-installing-updates
 # see ISystemInformation interface
-#     at https://msdn.microsoft.com/en-us/library/windows/desktop/aa386095(v=vs.85).aspx
+#     at https://learn.microsoft.com/en-us/windows/win32/api/wuapi/nn-wuapi-isysteminformation
 # see IUpdateSession interface
-#     at https://msdn.microsoft.com/en-us/library/windows/desktop/aa386854(v=vs.85).aspx
+#     at https://learn.microsoft.com/en-us/windows/win32/api/wuapi/nn-wuapi-iupdatesession
 # see IUpdateSearcher interface
-#     at https://msdn.microsoft.com/en-us/library/windows/desktop/aa386515(v=vs.85).aspx
+#     at https://learn.microsoft.com/en-us/windows/win32/api/wuapi/nn-wuapi-iupdatesearcher
 # see IUpdateSearcher::Search method
-#     at https://docs.microsoft.com/en-us/windows/desktop/api/wuapi/nf-wuapi-iupdatesearcher-search
+#     at https://learn.microsoft.com/en-us/windows/win32/api/wuapi/nf-wuapi-iupdatesearcher-search
 # see IUpdateDownloader interface
-#     at https://msdn.microsoft.com/en-us/library/windows/desktop/aa386131(v=vs.85).aspx
+#     at https://learn.microsoft.com/en-us/windows/win32/api/wuapi/nn-wuapi-iupdatedownloader
 # see IUpdateCollection interface
-#     at https://msdn.microsoft.com/en-us/library/windows/desktop/aa386107(v=vs.85).aspx
+#     at https://learn.microsoft.com/en-us/windows/win32/api/wuapi/nn-wuapi-iupdatecollection
 # see IUpdate interface
-#     at https://msdn.microsoft.com/en-us/library/windows/desktop/aa386099(v=vs.85).aspx
+#     at https://learn.microsoft.com/en-us/windows/win32/api/wuapi/nn-wuapi-iupdate
 # see xWindowsUpdateAgent DSC resource
-#     at https://github.com/PowerShell/xWindowsUpdate/blob/dev/DscResources/MSFT_xWindowsUpdateAgent/MSFT_xWindowsUpdateAgent.psm1
+#     at https://github.com/dsccommunity/xWindowsUpdate/tree/master/source/DSCResources/MSFT_xWindowsUpdateAgent
 # NB you can install common sets of updates with one of these settings:
 #       | Name          | SearchCriteria                            | Filters       |
 #       |---------------|-------------------------------------------|---------------|
@@ -39,6 +39,15 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $mock = $false
+
+$operationResultCodes = @{
+    0 = "NotStarted";
+    1 = "InProgress";
+    2 = "Succeeded";
+    3 = "SucceededWithErrors";
+    4 = "Failed";
+    5 = "Aborted"
+}
 
 function ExitWithCode($exitCode) {
     $host.SetShouldExit($exitCode)
@@ -160,44 +169,6 @@ function Join-PSObject {
     return $results
 }
 
-trap {
-    Write-Output "ERROR: $_"
-    Write-Output (($_.ScriptStackTrace -split '\r?\n') -replace '^(.*)$','ERROR: $1')
-    Write-Output (($_.Exception.ToString() -split '\r?\n') -replace '^(.*)$','ERROR EXCEPTION: $1')
-    ExitWithCode 1
-}
-
-if ($mock) {
-    $mockWindowsUpdatePath = 'C:\Windows\Temp\windows-update-count-mock.txt'
-    if (!(Test-Path $mockWindowsUpdatePath)) {
-        Set-Content $mockWindowsUpdatePath 10
-    }
-    $count = [int]::Parse((Get-Content $mockWindowsUpdatePath).Trim())
-    if ($count) {
-        Write-Output "Synthetic reboot countdown counter is at $count"
-        Set-Content $mockWindowsUpdatePath (--$count)
-        ExitWithCode 101
-    }
-    Write-Output 'No Windows updates found'
-    ExitWithCode 0
-}
-
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-
-public static class Windows
-{
-    [DllImport("kernel32", SetLastError=true)]
-    public static extern UInt64 GetTickCount64();
-
-    public static TimeSpan GetUptime()
-    {
-        return TimeSpan.FromMilliseconds(GetTickCount64());
-    }
-}
-'@
-
 function Wait-Condition {
     param(
       [scriptblock]$Condition,
@@ -220,16 +191,8 @@ function Wait-Condition {
     }
 }
 
-$operationResultCodes = @{
-    0 = "NotStarted";
-    1 = "InProgress";
-    2 = "Succeeded";
-    3 = "SucceededWithErrors";
-    4 = "Failed";
-    5 = "Aborted"
-}
-
-function LookupOperationResultCode($code) {
+function LookupOperationResultCode($code) 
+{   
     if ($operationResultCodes.ContainsKey($code)) {
         return $operationResultCodes[$code]
     }
@@ -255,7 +218,7 @@ function ExitWhenRebootRequired($rebootRequired = $false) {
         if($UseExtendedValidation)
         { 
             Write-Output 'Waiting for the Windows Modules Installer to exit or updates to complete...'
-            Wait-Condition {(Get-Process -ErrorAction SilentlyContinue TiWorker | Measure-Object).Count -eq 0 -or (UpdatesComplete)} 
+            Wait-Condition {(Get-Process -ErrorAction SilentlyContinue TiWorker | Measure-Object).Count -eq 0 -or (Search-WindowsUpdateStatus)} 
         }
         else 
         { 
@@ -278,9 +241,27 @@ function ExitWhenRebootRequired($rebootRequired = $false) {
     }
 }
 
+# Function to get the list of pending reboot GUIDs from the registry
+function Get-PendingReboot
+{
+    # Regex for matching GUIDs, which we will pull from the reboot pending list
+    $guidRegex = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+    # Registry key path for the reboot pending list
+    $regKeyPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+
+    # Get the list of GUIDs from the reboot pending registry key
+    $arrPendingReboot = (Get-ItemProperty -Path $regKeyPath -ErrorAction SilentlyContinue -WarningAction SilentlyContinue).PSObject.Properties |
+                            Where-Object { $_.Name -match $guidRegex } |
+                            Select-Object -ExpandProperty Name
+
+    # Return the list of GUIDs indicating pending reboots
+    return $arrPendingReboot
+}
+
 # Using eventvwr, search system logs for WindowsUpdateClient source.  Return the status of the KBArticles in the array
 # to determine if they are completed or not.  If completed, return true.  If not completed, return false.
-function UpdatesComplete
+function Search-WindowsUpdateStatus
 {
     param(
         [string[]]$kbarticles = @()
@@ -289,11 +270,36 @@ function UpdatesComplete
     
     # Search pattern for extracting exit code
     $EventLogExitCodePattern = "0x[0-9A-Fa-f]+"
-    
-    # Search the event log
-    $event_kb_logs = Get-EventLog -LogName System -Source Microsoft-Windows-WindowsUpdateClient |
-                        Where-Object { $_.Message -match 'KB\d+' -or $_.ReplacementStrings -join ";" -match 'KB\d+' } |
-                        Group-Object { if ($_.Message -match 'KB\d+' -or $_.ReplacementStrings -join ";" -match 'KB\d+') { $matches[0] } } |
+
+    # Get the list of GUIDs for updates that are still awaiting a reboot to finish installing
+    try
+    {
+        $pending_reboot_guids = @(Get-PendingReboot)
+    }
+    catch
+    {
+        Write-Output "Error obtaining pending reboot GUIDs $($_.Exception.Message)"
+        $pending_reboot_guids = @()
+    }
+
+    # Search the event log, using the XML view so the updateGuid/updateTitle fields can be read reliably
+    $event_kb_logs = Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-WindowsUpdateClient'} -ErrorAction SilentlyContinue |
+                        ForEach-Object {
+                            $xml = [xml]$_.ToXml()
+                            $eventData = $xml.Event.EventData.Data
+                            $updateGuid = ($eventData | Where-Object Name -eq 'updateGuid').'#text' -replace '[{}]',''
+                            $updateTitle = ($eventData | Where-Object Name -eq 'updateTitle').'#text'
+                            if (!$updateTitle -or $updateTitle -notmatch 'KB\d+') { return }
+                            [PSCustomObject]@{
+                                ArticleID     = $matches[0]
+                                UpdateGuid    = $updateGuid
+                                UpdateTitle   = $updateTitle
+                                TimeGenerated = $_.TimeCreated
+                                EventID       = $_.Id
+                                Message       = $_.Message
+                            }
+                        } |
+                        Group-Object ArticleID |
                         ForEach-Object {
                             $latest = $_.Group | Sort-Object TimeGenerated -Descending | Select-Object -First 1
                             $event_return_code = ""
@@ -325,11 +331,20 @@ function UpdatesComplete
                                     break
                                 }
                             }
+                            # A GUID still listed under RebootPending means the update needs a reboot to finish
+                            $requiresReboot = $latest.UpdateGuid -and $pending_reboot_guids -contains $latest.UpdateGuid
+                            if ($requiresReboot)
+                            {
+                                $install_status = "RequiresReboot"
+                                $completion_status = $false
+                            }
                             [PSCustomObject]@{
                                 ArticleID     = $_.Name
                                 EventTimeGenerated = $latest.TimeGenerated
                                 EventID       = $latest.EventID
                                 EventResultCode = $event_return_code
+                                EventUpdateGuid = $latest.UpdateGuid
+                                EventRequiresReboot = $requiresReboot
                                 EventInstallComplete      = $completion_status
                                 EventInstallStatus        = $install_status
                                 EventMessage       = $latest.Message
@@ -389,7 +404,14 @@ function UpdatesComplete
     $hotfix_install_logs = @()
 
     # Get all of the installed hotfixes
-    try { $hotfix_install_statuses = Get-HotFix -ErrorAction SilentlyContinue -WarningAction SilentlyContinue } catch { Write-Output "Error obtaining logs using Get-Hotfix $($_.Exception.Message)" }
+    try 
+    { 
+        $hotfix_install_statuses = Get-HotFix -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 
+    } 
+    catch 
+    { 
+        Write-Output "Error obtaining logs using Get-Hotfix $($_.Exception.Message)" 
+    }
 
     # Search the Get-Hotfix logs for additional patch details
     if($null -ne $hotfix_install_statuses)
@@ -430,8 +452,14 @@ function UpdatesComplete
         # If the event install or hotfix install has completed, mark the overall completion status
         if($windows_update.EventInstallComplete -or $windows_update.HotfixInstallComplete) { $overall_completion_status = $true } else {$overall_completion_status = $false }
 
+        # A pending reboot GUID match takes priority over any "Installed" status, since the update isn't done until the reboot happens
+        if($windows_update.EventRequiresReboot)
+        {
+            $overall_install_status = "RequiresReboot"
+            $overall_completion_status = $false
+        }
         # If the event install status is installed OR the Hotfix install status is installed OR the CBS status code is success, then mark the overall status as installed
-        if($windows_update.EventInstallStatus -eq "Installed" -or $windows_update.HotfixInstallStatus -eq "Installed" -or $windows_update.CBSResultCode -eq "0x00000000")
+        elseif($windows_update.EventInstallStatus -eq "Installed" -or $windows_update.HotfixInstallStatus -eq "Installed" -or $windows_update.CBSResultCode -eq "0x00000000")
         {
             $overall_install_status = "Installed"
             $overall_completion_status = $true
@@ -504,6 +532,45 @@ function Repair-WindowsUpdate {
     Write-Output 'Restarting the machine to retry a new windows update round...'
     ExitWithCode 101
 }
+
+trap {
+    Write-Output "ERROR: $_"
+    Write-Output (($_.ScriptStackTrace -split '\r?\n') -replace '^(.*)$','ERROR: $1')
+    Write-Output (($_.Exception.ToString() -split '\r?\n') -replace '^(.*)$','ERROR EXCEPTION: $1')
+    ExitWithCode 1
+}
+
+if ($mock) {
+    $mockWindowsUpdatePath = 'C:\Windows\Temp\windows-update-count-mock.txt'
+    if (!(Test-Path $mockWindowsUpdatePath)) {
+        Set-Content $mockWindowsUpdatePath 10
+    }
+    $count = [int]::Parse((Get-Content $mockWindowsUpdatePath).Trim())
+    if ($count) {
+        Write-Output "Synthetic reboot countdown counter is at $count"
+        Set-Content $mockWindowsUpdatePath (--$count)
+        ExitWithCode 101
+    }
+    Write-Output 'No Windows updates found'
+    ExitWithCode 0
+}
+
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class Windows
+{
+    [DllImport("kernel32", SetLastError=true)]
+    public static extern UInt64 GetTickCount64();
+
+    public static TimeSpan GetUptime()
+    {
+        return TimeSpan.FromMilliseconds(GetTickCount64());
+    }
+}
+'@
+
 
 ExitWhenRebootRequired
 
